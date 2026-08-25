@@ -1,6 +1,10 @@
+import vm from 'node:vm';
+
 import { expect, test, vitest } from 'vitest';
 
 import { AutoReconnectConnection } from '../connection';
+import { BroadcastChannelAwarenessStorage } from '../../impls/broadcast-channel/awareness';
+import { type AwarenessRecord } from '../../storage';
 
 test('connect and disconnect', async () => {
   class TestConnection extends AutoReconnectConnection<{
@@ -315,4 +319,89 @@ test('connecting timeout', async () => {
   // no reconnect after disconnect
   expect(connection.connectCount).toBe(5);
   expect(connection.status).toBe('closed');
+});
+
+test('synchronous connection establishes immediately', () => {
+  class SyncTestConnection extends AutoReconnectConnection<{ id: string }> {
+    override doConnect() {
+      return { id: 'sync-conn' };
+    }
+    override doDisconnect() {}
+  }
+
+  const connection = new SyncTestConnection();
+  expect(connection.status).toBe('idle');
+  connection.connect();
+  expect(connection.status).toBe('connected');
+  expect(connection.inner).toEqual({ id: 'sync-conn' });
+  connection.disconnect();
+  expect(connection.status).toBe('closed');
+});
+
+test('cross-realm promise is awaited before becoming connected', async () => {
+  const foreignPromise = vm.runInNewContext(
+    'Promise.resolve({ id: "cross-realm" })'
+  );
+  expect(foreignPromise instanceof Promise).toBe(false);
+
+  class CrossRealmConnection extends AutoReconnectConnection<{ id: string }> {
+    // No cast required: doConnect is PromiseLike<T> | T
+    override doConnect(): PromiseLike<{ id: string }> {
+      return foreignPromise;
+    }
+    override doDisconnect() {}
+  }
+
+  const connection = new CrossRealmConnection();
+  connection.connect();
+
+  await vitest.waitFor(() => {
+    expect(connection.status).toBe('connected');
+    expect(connection.inner).toEqual({ id: 'cross-realm' });
+  });
+
+  connection.disconnect();
+  expect(connection.status).toBe('closed');
+});
+
+test('synchronous doConnect throwing sets error status', () => {
+  const boom = new Error('sync connect failed');
+  class ThrowingConnection extends AutoReconnectConnection<void> {
+    override doConnect(): void {
+      throw boom;
+    }
+    override doDisconnect() {}
+  }
+
+  const connection = new ThrowingConnection();
+  connection.connect();
+  expect(connection.status).toBe('error');
+  expect(connection.error).toBe(boom);
+  connection.disconnect();
+});
+
+test('BroadcastChannelAwarenessStorage: subscribeUpdate works immediately after connect', () => {
+  const storage = new BroadcastChannelAwarenessStorage({ id: 'test-workspace' });
+  storage.connection.connect();
+  // connection must be synchronously connected — no await / microtask needed
+  expect(storage.connection.status).toBe('connected');
+
+  const updates: AwarenessRecord[] = [];
+  const unsubscribe = storage.subscribeUpdate(
+    'test-doc',
+    update => updates.push(update),
+    () => Promise.resolve(null)
+  );
+
+  // Send a round-trip message; it is a same-origin channel so the update
+  // dispatches synchronously via the connection's channel reference.
+  storage.connection.inner.postMessage({
+    type: 'awareness-update',
+    docId: 'test-doc',
+    bin: new Uint8Array([1, 2, 3]),
+  });
+
+  unsubscribe();
+  storage.connection.disconnect();
+  expect(storage.connection.status).toBe('closed');
 });
